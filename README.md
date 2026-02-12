@@ -1,0 +1,1 @@
+# Wingspan Card Values
