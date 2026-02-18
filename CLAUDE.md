@@ -3,7 +3,7 @@
 ## Workflow
 - Use traditional git branching from the main repo directory: `C:\Users\User\Projects\wingspan_cards`
 - Do NOT use git worktrees. Create feature branches, merge to main.
-- Python virtual environment lives in `venv/` (gitignored).
+- Python virtual environment lives in `.venv_wingspan/` (gitignored).
 
 ## Tech Stack
 - Python 3, pip + venv
@@ -18,5 +18,5 @@
 - `output/` — generated files, plots (gitignored)
 
 ## Conventions
-- Activate venv before running: `venv\Scripts\activate`
+- Activate venv before running: `.venv_wingspan\Scripts\activate`
 - Data loading: `from src.load_data import load_bird_data`
