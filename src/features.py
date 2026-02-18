@@ -27,6 +27,8 @@ the most common foods (invertebrate, seed) have weight 1.0. This means
 rarer foods cost more "effective" food units.
 """
 
+import re
+
 import pandas as pd
 import numpy as np
 
@@ -76,6 +78,169 @@ BONUS_CARD_COLS = [
 
 # Nest types in the dataset (wild = star nest)
 NEST_TYPES = ["bowl", "cavity", "ground", "platform", "wild", "none"]
+
+# ---------------------------------------------------------------------------
+# Power mechanic regex patterns (applied case-insensitively to power_text)
+# ---------------------------------------------------------------------------
+
+_FOOD_TOKENS = r"die|invertebrate|seed|fish|fruit|rodent|wild|nectar"
+
+POWER_MECHANIC_PATTERNS_DICT = {
+    "mech_gain_food": re.compile(
+        rf"gain \d+ \[(?:{_FOOD_TOKENS})\]",
+        re.IGNORECASE,
+    ),
+    "mech_draw_card": re.compile(
+        r"draw \d+ \[card\]",
+        re.IGNORECASE,
+    ),
+    "mech_lay_egg": re.compile(
+        r"lay \d+ \[egg\]",
+        re.IGNORECASE,
+    ),
+    "mech_tuck": re.compile(
+        r"tuck \d+ \[card\]",
+        re.IGNORECASE,
+    ),
+    "mech_cache": re.compile(
+        r"cache \d+ \[",
+        re.IGNORECASE,
+    ),
+    "mech_from_supply": re.compile(
+        r"from the supply|from your supply",
+        re.IGNORECASE,
+    ),
+    "mech_from_feeder": re.compile(
+        r"from the birdfeeder",
+        re.IGNORECASE,
+    ),
+    "mech_reset_feeder": re.compile(
+        r"reset the birdfeeder",
+        re.IGNORECASE,
+    ),
+    "mech_bonus_card": re.compile(
+        r"bonus card",
+        re.IGNORECASE,
+    ),
+    "mech_play_bird": re.compile(
+        r"play (?:an additional|another) bird",
+        re.IGNORECASE,
+    ),
+    "mech_repeat_copy": re.compile(
+        r"repeat.*power|copy.*power|you may copy",
+        re.IGNORECASE,
+    ),
+    "mech_predator": re.compile(
+        r"look at a \[card\].*tuck.*discard|roll all dice not in birdfeeder",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    "mech_other_player": re.compile(
+        r"another player|other player|each player|all players"
+        r"|player.*left|player.*right",
+        re.IGNORECASE,
+    ),
+    "mech_discard_to_gain": re.compile(
+        r"discard.*to (?:tuck|gain|draw|lay|cache)",
+        re.IGNORECASE,
+    ),
+}
+
+# Numeric extraction patterns for magnitude features
+_TUCK_COUNT_RE = re.compile(
+    r"tuck (\d+) \[card\]|up to (\d+) \[card\].*tuck",
+    re.IGNORECASE,
+)
+_EGG_COUNT_RE = re.compile(
+    r"lay (\d+) \[egg\]",
+    re.IGNORECASE,
+)
+_DRAW_COUNT_RE = re.compile(
+    r"draw (\d+) \[card\]",
+    re.IGNORECASE,
+)
+_FOOD_COUNT_RE = re.compile(
+    rf"gain (\d+) \[(?:{_FOOD_TOKENS})\]",
+    re.IGNORECASE,
+)
+
+POWER_MECHANIC_FEATURES_LIST = [
+    # Binary regex features
+    "mech_gain_food",
+    "mech_draw_card",
+    "mech_lay_egg",
+    "mech_tuck",
+    "mech_cache",
+    "mech_from_supply",
+    "mech_from_feeder",
+    "mech_reset_feeder",
+    "mech_bonus_card",
+    "mech_play_bird",
+    "mech_repeat_copy",
+    "mech_predator",
+    "mech_other_player",
+    "mech_discard_to_gain",
+    # Pre-tagged from raw data
+    "mech_flocking",
+    "mech_predator_tag",
+    # Numeric magnitude
+    "mech_max_tuck_count",
+    "mech_max_egg_count",
+    "mech_max_draw_count",
+    "mech_max_food_count",
+]
+
+
+def _extract_max_match(pattern: re.Pattern, text: str) -> int:
+    """Return the max numeric group captured by pattern, or 0 if no match."""
+    matches = pattern.findall(text)
+    if not matches:
+        return 0
+    # findall returns tuples when pattern has multiple groups
+    if isinstance(matches[0], tuple):
+        values_list = [int(v) for m in matches for v in m if v]
+    else:
+        values_list = [int(m) for m in matches]
+    return max(values_list) if values_list else 0
+
+
+def parse_power_mechanics(feat_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Parse power text into binary and numeric mechanic features.
+
+    Args:
+        feat_df: Feature matrix (needs power_text column).
+        raw_df: Raw bird data (needs Flocking and Predator columns).
+
+    Returns:
+        DataFrame with 20 mechanic feature columns, same index as feat_df.
+    """
+    text_series = feat_df["power_text"].fillna("")
+    mech_df = pd.DataFrame(index=feat_df.index)
+
+    # Binary regex features
+    for name, pattern in POWER_MECHANIC_PATTERNS_DICT.items():
+        mech_df[name] = text_series.apply(
+            lambda t, p=pattern: int(bool(p.search(t)))
+        )
+
+    # Pre-tagged features from raw data
+    mech_df["mech_flocking"] = raw_df["Flocking"].notna().astype(int)
+    mech_df["mech_predator_tag"] = raw_df["Predator"].notna().astype(int)
+
+    # Numeric magnitude features
+    mech_df["mech_max_tuck_count"] = text_series.apply(
+        lambda t: _extract_max_match(_TUCK_COUNT_RE, t)
+    )
+    mech_df["mech_max_egg_count"] = text_series.apply(
+        lambda t: _extract_max_match(_EGG_COUNT_RE, t)
+    )
+    mech_df["mech_max_draw_count"] = text_series.apply(
+        lambda t: _extract_max_match(_DRAW_COUNT_RE, t)
+    )
+    mech_df["mech_max_food_count"] = text_series.apply(
+        lambda t: _extract_max_match(_FOOD_COUNT_RE, t)
+    )
+
+    return mech_df
 
 
 # ---------------------------------------------------------------------------
@@ -155,11 +320,33 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
         color_yellow        : 1 if power color is yellow
         has_power           : 1 if bird has any power
 
+    Power mechanic features (parsed from power text):
+        mech_gain_food      : 1 if power gains food tokens
+        mech_draw_card      : 1 if power draws bird cards
+        mech_lay_egg        : 1 if power lays eggs
+        mech_tuck           : 1 if power tucks cards
+        mech_cache          : 1 if power caches food on bird
+        mech_from_supply    : 1 if food comes from general supply
+        mech_from_feeder    : 1 if food comes from birdfeeder
+        mech_reset_feeder   : 1 if power resets the birdfeeder
+        mech_bonus_card     : 1 if power involves bonus cards
+        mech_play_bird      : 1 if power plays an additional bird
+        mech_repeat_copy    : 1 if power repeats/copies another power
+        mech_predator       : 1 if power is a predator hunt mechanic
+        mech_other_player   : 1 if power involves other players
+        mech_discard_to_gain: 1 if power requires discarding to gain benefit
+        mech_flocking       : 1 if bird has flocking flag (from raw data)
+        mech_predator_tag   : 1 if bird has predator flag (from raw data)
+        mech_max_tuck_count : Max cards tucked per activation
+        mech_max_egg_count  : Max eggs laid per activation
+        mech_max_draw_count : Max cards drawn per activation
+        mech_max_food_count : Max food gained per activation
+
     Also preserves:
         common_name         : Bird name for identification
         victory_points      : Dependent variable
         color               : Raw power color (for grouping)
-        power_text          : Raw power description (for later parsing)
+        power_text          : Raw power description (for parsing)
     """
     feat = pd.DataFrame(index=df.index)
 
@@ -204,6 +391,11 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     feat["color_teal"] = (df["Color"] == "teal").astype(int)
     feat["color_pink"] = (df["Color"] == "pink").astype(int)
     feat["color_yellow"] = (df["Color"] == "yellow").astype(int)
+
+    # --- Power mechanic features (parsed from power text + raw flags) ---
+    mech_df = parse_power_mechanics(feat, df)
+    for col in mech_df.columns:
+        feat[col] = mech_df[col]
 
     return feat
 
