@@ -130,10 +130,6 @@ POWER_MECHANIC_PATTERNS_DICT = {
         r"repeat.*power|copy.*power|you may copy",
         re.IGNORECASE,
     ),
-    "mech_predator": re.compile(
-        r"look at a \[card\].*tuck.*discard|roll all dice not in birdfeeder",
-        re.IGNORECASE | re.DOTALL,
-    ),
     "mech_other_player": re.compile(
         r"another player|other player|each player|all players"
         r"|player.*left|player.*right",
@@ -176,18 +172,220 @@ POWER_MECHANIC_FEATURES_LIST = [
     "mech_bonus_card",
     "mech_play_bird",
     "mech_repeat_copy",
-    "mech_predator",
     "mech_other_player",
     "mech_discard_to_gain",
     # Pre-tagged from raw data
     "mech_flocking",
-    "mech_predator_tag",
+    # Predator sub-types (replace old mech_predator + mech_predator_tag)
+    "pred_look_wingspan",
+    "pred_roll_dice",
+    "pred_play_on_top",
+    "pred_pay_card",
+    "pred_other",
+    "pred_success_prob",
     # Numeric magnitude
     "mech_max_tuck_count",
     "mech_max_egg_count",
     "mech_max_draw_count",
     "mech_max_food_count",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Predator sub-type classification and success probability
+# ---------------------------------------------------------------------------
+
+# Regex patterns for predator sub-type detection
+_PRED_LOOK_WINGSPAN_RE = re.compile(
+    r"look at a \[card\].*(?:less than|over) \d+\s*cm",
+    re.IGNORECASE | re.DOTALL,
+)
+_PRED_ROLL_DICE_RE = re.compile(
+    r"roll all dice not in birdfeeder"
+    r"|roll any \d+ \[die\]"
+    r"|choose any \d+ \[die\].*roll"
+    r"|roll all \[die\] that are in the birdfeeder"
+    r"|roll all 5 \[die\]",
+    re.IGNORECASE,
+)
+_PRED_PLAY_ON_TOP_RE = re.compile(
+    r"play this bird on top of another bird",
+    re.IGNORECASE,
+)
+_PRED_PAY_CARD_RE = re.compile(
+    r"you may pay 1 \[card\] from your hand instead",
+    re.IGNORECASE,
+)
+
+# Wingspan threshold extraction for look-type predators
+_WINGSPAN_UNDER_RE = re.compile(r"less than (\d+)\s*cm", re.IGNORECASE)
+_WINGSPAN_OVER_RE = re.compile(r"over (\d+)\s*cm", re.IGNORECASE)
+
+# Roll-dice food target extraction
+_ROLL_FOOD_TARGET_RE = re.compile(
+    r"if (?:any are|you roll (?:at least 1|a)) \[(\w+)\]",
+    re.IGNORECASE,
+)
+
+
+def _compute_look_wingspan_success_prob(
+    text: str,
+    wingspan_values_array: np.ndarray,
+) -> float:
+    """Compute fraction of the card pool that satisfies a wingspan predator's condition.
+
+    Args:
+        text: Power text of the predator bird.
+        wingspan_values_array: Array of all wingspan values in cm (NaN for star wingspan).
+
+    Returns:
+        Probability (0-1) that a random card from the pool satisfies the condition.
+    """
+    # "less than N cm" — prey must have wingspan < N
+    m = _WINGSPAN_UNDER_RE.search(text)
+    if m:
+        threshold = int(m.group(1))
+        valid = np.nansum(wingspan_values_array < threshold)
+        return valid / len(wingspan_values_array)
+
+    # "over N cm" — prey must have wingspan > N (e.g. Wedge-Tailed Eagle)
+    m = _WINGSPAN_OVER_RE.search(text)
+    if m:
+        threshold = int(m.group(1))
+        valid = np.nansum(wingspan_values_array > threshold)
+        return valid / len(wingspan_values_array)
+
+    return 0.0
+
+
+def _compute_roll_dice_success_prob(text: str) -> float:
+    """Compute expected success probability for roll-dice predators.
+
+    Assumes the number of dice outside the birdfeeder is uniformly distributed
+    over 0-4 (the feeder holds 5 dice, and should never be completely empty).
+
+    For "roll all dice not in birdfeeder": P(success) = E[1 - (1-p)^k] for k ~ Uniform(0,4)
+    where p is the single-die probability of showing the target food.
+
+    For "roll any N [die]" or "choose any N [die]": uses fixed N dice with
+    the same per-die probability.
+
+    Returns:
+        Expected probability of a successful hunt (0-1).
+    """
+    t = text.lower()
+
+    # Determine target food and its per-die probability
+    food_match = _ROLL_FOOD_TARGET_RE.search(text)
+    if food_match:
+        target_food = food_match.group(1).capitalize()
+        # Map token names to FOOD_AVAILABILITY keys
+        token_to_food_dict = {
+            "Invertebrate": "Invertebrate",
+            "Seed": "Seed",
+            "Fish": "Fish",
+            "Fruit": "Fruit",
+            "Rodent": "Rodent",
+            "Nectar": "Nectar",
+        }
+        p_food = FOOD_AVAILABILITY.get(
+            token_to_food_dict.get(target_food, target_food),
+            1 / 6,
+        )
+    else:
+        # Default assumption for unrecognized targets
+        p_food = 1 / 6
+
+    # "roll all dice not in birdfeeder" — variable number of dice (0-4)
+    if "roll all dice not in birdfeeder" in t:
+        total_prob = 0.0
+        for k in range(5):  # k = 0, 1, 2, 3, 4
+            total_prob += 1 - (1 - p_food) ** k
+        return total_prob / 5
+
+    # "roll any N [die]" or "choose any N [die]" — fixed N dice
+    n_match = re.search(r"(?:roll any|choose any) (\d+) \[die\]", t)
+    if n_match:
+        n_dice = int(n_match.group(1))
+        return 1 - (1 - p_food) ** n_dice
+
+    # "roll all 5 [die]" — all 5 dice
+    if "roll all 5 [die]" in t:
+        return 1 - (1 - p_food) ** 5
+
+    # "roll all [die] that are in the birdfeeder" — variable (1-5)
+    if "roll all [die] that are in the birdfeeder" in t:
+        total_prob = 0.0
+        for k in range(1, 6):  # k = 1, 2, 3, 4, 5
+            total_prob += 1 - (1 - p_food) ** k
+        return total_prob / 5
+
+    return 0.0
+
+
+def _parse_predator_features(
+    feat_df: pd.DataFrame,
+    raw_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Classify predator birds into sub-types and compute success probabilities.
+
+    Sub-types:
+        pred_look_wingspan  : "Look at card, tuck if wingspan meets threshold"
+        pred_roll_dice      : "Roll dice, cache if target food appears"
+        pred_play_on_top    : "Play on top of another bird" (white predators)
+        pred_pay_card       : "Pay cards instead of rodent cost" (white predators)
+        pred_other          : All other predator-tagged birds
+        pred_success_prob   : Estimated success probability (0-1) for look/roll types
+
+    Args:
+        feat_df: Feature matrix (needs power_text column).
+        raw_df: Raw bird data (needs Predator and Wingspan columns).
+
+    Returns:
+        DataFrame with 6 predator feature columns.
+    """
+    text_series = feat_df["power_text"].fillna("")
+    is_predator = raw_df["Predator"].notna()
+
+    pred_df = pd.DataFrame(0, index=feat_df.index, columns=[
+        "pred_look_wingspan",
+        "pred_roll_dice",
+        "pred_play_on_top",
+        "pred_pay_card",
+        "pred_other",
+    ])
+    pred_df["pred_success_prob"] = 0.0
+
+    # Pre-compute wingspan values for the entire card pool
+    wingspan_values_array = pd.to_numeric(
+        raw_df["Wingspan"],
+        errors="coerce",
+    ).values
+
+    for idx in feat_df.index:
+        if not is_predator.loc[idx]:
+            continue
+
+        t = text_series.loc[idx]
+
+        if _PRED_LOOK_WINGSPAN_RE.search(t):
+            pred_df.loc[idx, "pred_look_wingspan"] = 1
+            pred_df.loc[idx, "pred_success_prob"] = (
+                _compute_look_wingspan_success_prob(t, wingspan_values_array)
+            )
+        elif _PRED_ROLL_DICE_RE.search(t):
+            pred_df.loc[idx, "pred_roll_dice"] = 1
+            pred_df.loc[idx, "pred_success_prob"] = (
+                _compute_roll_dice_success_prob(t)
+            )
+        elif _PRED_PLAY_ON_TOP_RE.search(t):
+            pred_df.loc[idx, "pred_play_on_top"] = 1
+        elif _PRED_PAY_CARD_RE.search(t):
+            pred_df.loc[idx, "pred_pay_card"] = 1
+        else:
+            pred_df.loc[idx, "pred_other"] = 1
+
+    return pred_df
 
 
 def _extract_max_match(pattern: re.Pattern, text: str) -> int:
@@ -224,7 +422,11 @@ def parse_power_mechanics(feat_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.Dat
 
     # Pre-tagged features from raw data
     mech_df["mech_flocking"] = raw_df["Flocking"].notna().astype(int)
-    mech_df["mech_predator_tag"] = raw_df["Predator"].notna().astype(int)
+
+    # Predator sub-types (replaces old mech_predator + mech_predator_tag)
+    pred_features_df = _parse_predator_features(feat_df, raw_df)
+    for col in pred_features_df.columns:
+        mech_df[col] = pred_features_df[col]
 
     # Numeric magnitude features
     mech_df["mech_max_tuck_count"] = text_series.apply(
@@ -332,11 +534,15 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
         mech_bonus_card     : 1 if power involves bonus cards
         mech_play_bird      : 1 if power plays an additional bird
         mech_repeat_copy    : 1 if power repeats/copies another power
-        mech_predator       : 1 if power is a predator hunt mechanic
         mech_other_player   : 1 if power involves other players
         mech_discard_to_gain: 1 if power requires discarding to gain benefit
         mech_flocking       : 1 if bird has flocking flag (from raw data)
-        mech_predator_tag   : 1 if bird has predator flag (from raw data)
+        pred_look_wingspan  : 1 if predator hunts by wingspan threshold
+        pred_roll_dice      : 1 if predator hunts by rolling dice for food
+        pred_play_on_top    : 1 if predator plays on top of another bird
+        pred_pay_card       : 1 if predator pays cards instead of rodent
+        pred_other          : 1 if predator with other mechanic
+        pred_success_prob   : Estimated hunt success probability (0-1)
         mech_max_tuck_count : Max cards tucked per activation
         mech_max_egg_count  : Max eggs laid per activation
         mech_max_draw_count : Max cards drawn per activation
